@@ -12,7 +12,7 @@ This project provides local text-to-speech capabilities using PyTorch.
 
 1.  **Clone the repository:**
     ```bash
-    git clone <REPOSITORY_URL>
+    git clone [<REPOSITORY_URL>](https://github.com/onetapdevai/local_tts.git)
     cd <PROJECT_DIRECTORY_NAME>
     ```
 
