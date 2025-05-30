@@ -2,10 +2,13 @@ import sys
 import os
 import datetime
 import threading
+import subprocess # Added for playing audio
+import math # For duration formatting
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QCheckBox, QTextEdit,
-    QFileDialog, QMessageBox, QProgressDialog
+    QFileDialog, QMessageBox, QProgressDialog, QSlider, QGroupBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
 )
 from PySide6.QtCore import Qt, Signal, QObject
 
@@ -39,6 +42,16 @@ except ImportError as e:
         @staticmethod
         def save(filepath, tensor, sample_rate):
             print(f"Dummy save: {filepath}")
+
+        @staticmethod
+        def info(filepath):
+            print(f"Dummy torchaudio.info called for {filepath}")
+            # Return a dummy object that mimics the structure needed for duration calculation
+            class DummyInfo:
+                def __init__(self):
+                    self.num_frames = 0
+                    self.sample_rate = 16000 # Dummy sample rate
+            return DummyInfo()
         
         # Removed dummy is_available from ta, as we'll use torch.cuda.is_available
 
@@ -52,11 +65,14 @@ class TTSWorker(QObject):
     error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, text, use_custom_voice, custom_voice_path):
+    def __init__(self, text, use_custom_voice, custom_voice_path, exaggeration, temperature, cfg_weight):
         super().__init__()
         self.text = text
         self.use_custom_voice = use_custom_voice
         self.custom_voice_path = custom_voice_path
+        self.exaggeration = exaggeration
+        self.temperature = temperature
+        self.cfg_weight = cfg_weight
         self.model = None
 
     def load_model(self):
@@ -108,8 +124,14 @@ class TTSWorker(QObject):
             else:
                 self.progress.emit("Using standard voice.")
 
-            self.progress.emit(f"Synthesizing: '{self.text[:50]}...'")
-            wav = self.model.generate(self.text, audio_prompt_path=audio_prompt_to_use)
+            self.progress.emit(f"Synthesizing: '{self.text[:50]}...' with Exaggeration: {self.exaggeration}, Temp: {self.temperature}, CFG: {self.cfg_weight}")
+            wav = self.model.generate(
+                self.text,
+                audio_prompt_path=audio_prompt_to_use,
+                exaggeration=self.exaggeration,
+                temperature=self.temperature,
+                cfg_weight=self.cfg_weight
+            )
             
             output_filename = f"{filename_base}.wav"
             output_path = os.path.join(OUTPUT_DIR, output_filename)
@@ -136,8 +158,10 @@ class TTSApp(QWidget):
         self.current_audio_file = None
         self.tts_thread = None
         self.worker = None
+        self.generated_audio_files = [] # To store info about generated files
 
         self._init_ui()
+        self._load_existing_audio_files() # Load existing files on startup
 
         if not TTS_AVAILABLE:
             self.status_text.setText("TTS libraries not found. Please install them (chatterbox-tts, torchaudio).")
@@ -171,6 +195,49 @@ class TTSApp(QWidget):
         custom_voice_layout.addWidget(self.browse_button)
         main_layout.addLayout(custom_voice_layout)
 
+        # Generation Parameters
+        params_groupbox = QGroupBox("Generation Parameters")
+        params_layout = QVBoxLayout()
+
+        # Exaggeration
+        self.exaggeration_label = QLabel(f"Exaggeration: {0.5:.2f} (Neutral = 0.5)")
+        params_layout.addWidget(self.exaggeration_label)
+        self.exaggeration_slider = QSlider(Qt.Horizontal)
+        self.exaggeration_slider.setRange(25, 200) # 0.25 to 2.00, step 0.05
+        self.exaggeration_slider.setValue(50) # Default 0.50
+        self.exaggeration_slider.setSingleStep(5)
+        self.exaggeration_slider.setTickInterval(25) # Tick for 0.25 steps
+        self.exaggeration_slider.setTickPosition(QSlider.TicksBelow)
+        self.exaggeration_slider.valueChanged.connect(lambda value: self.exaggeration_label.setText(f"Exaggeration: {value / 100:.2f} (Neutral = 0.5)"))
+        params_layout.addWidget(self.exaggeration_slider)
+
+        # Temperature
+        self.temperature_label = QLabel(f"Temperature: {0.8:.2f}")
+        params_layout.addWidget(self.temperature_label)
+        self.temperature_slider = QSlider(Qt.Horizontal)
+        self.temperature_slider.setRange(5, 500) # 0.05 to 5.00, step 0.05
+        self.temperature_slider.setValue(80) # Default 0.80
+        self.temperature_slider.setSingleStep(5)
+        self.temperature_slider.setTickInterval(50) # Tick for 0.5 steps
+        self.temperature_slider.setTickPosition(QSlider.TicksBelow)
+        self.temperature_slider.valueChanged.connect(lambda value: self.temperature_label.setText(f"Temperature: {value / 100:.2f}"))
+        params_layout.addWidget(self.temperature_slider)
+
+        # CFG Weight
+        self.cfg_weight_label = QLabel(f"CFG Weight/Pace: {0.5:.2f}")
+        params_layout.addWidget(self.cfg_weight_label)
+        self.cfg_weight_slider = QSlider(Qt.Horizontal)
+        self.cfg_weight_slider.setRange(20, 100) # 0.20 to 1.00, step 0.05
+        self.cfg_weight_slider.setValue(50) # Default 0.50
+        self.cfg_weight_slider.setSingleStep(5)
+        self.cfg_weight_slider.setTickInterval(10) # Tick for 0.1 steps
+        self.cfg_weight_slider.setTickPosition(QSlider.TicksBelow)
+        self.cfg_weight_slider.valueChanged.connect(lambda value: self.cfg_weight_label.setText(f"CFG Weight/Pace: {value / 100:.2f}"))
+        params_layout.addWidget(self.cfg_weight_slider)
+        
+        params_groupbox.setLayout(params_layout)
+        main_layout.addWidget(params_groupbox)
+
         # Generate Button
         self.generate_button = QPushButton("Generate Speech")
         self.generate_button.clicked.connect(self._start_tts_generation)
@@ -195,22 +262,101 @@ class TTSApp(QWidget):
         info_label.setWordWrap(True)
         main_layout.addWidget(info_label)
 
-    def _play_last_audio(self):
-        if self.current_audio_file and os.path.exists(self.current_audio_file):
-            try:
-                if sys.platform == "win32":
-                    os.startfile(self.current_audio_file)
-                elif sys.platform == "darwin": # macOS
-                    subprocess.call(["open", self.current_audio_file])
-                else: # Linux and other Unix-like
-                    subprocess.call(["xdg-open", self.current_audio_file])
-                self.status_text.append(f"Attempting to play: {self.current_audio_file}")
-            except Exception as e:
-                self.status_text.append(f"Error playing audio: {e}")
-                QMessageBox.warning(self, "Playback Error", f"Could not play audio file: {e}")
+        # Generated Audio List
+        audio_list_groupbox = QGroupBox("Generated Audio Files")
+        audio_list_layout = QVBoxLayout()
+
+        self.audio_table = QTableWidget()
+        self.audio_table.setColumnCount(4) # Filename, Duration, Play, Delete
+        self.audio_table.setHorizontalHeaderLabels(["File", "Duration", "Play", "Delete"])
+        self.audio_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch) # Filename
+        self.audio_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents) # Duration
+        self.audio_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents) # Play
+        self.audio_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents) # Delete
+        self.audio_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.audio_table.setEditTriggers(QAbstractItemView.NoEditTriggers) # Make table read-only
+        self.audio_table.setFixedHeight(150) # Adjust as needed
+        audio_list_layout.addWidget(self.audio_table)
+        
+        audio_list_groupbox.setLayout(audio_list_layout)
+        main_layout.addWidget(audio_list_groupbox)
+
+    def _play_last_audio(self): # This button might become redundant or act on the latest in the list
+        if self.generated_audio_files:
+            # Play the most recently added file
+            audio_to_play = self.generated_audio_files[-1]["path"]
+            if os.path.exists(audio_to_play):
+                self._play_audio_file(audio_to_play)
+            else:
+                self.status_text.append(f"Error: File {audio_to_play} not found.")
+                QMessageBox.warning(self, "Playback Error", f"File not found: {audio_to_play}")
+        elif self.current_audio_file and os.path.exists(self.current_audio_file): # Fallback for older logic if needed
+             self._play_audio_file(self.current_audio_file)
         else:
             self.status_text.append("No audio file to play or file not found.")
             QMessageBox.information(self, "Playback Info", "No audio has been generated yet, or the file is missing.")
+
+    def _play_audio_file(self, file_path):
+        if file_path and os.path.exists(file_path):
+            try:
+                if sys.platform == "win32":
+                    os.startfile(file_path)
+                elif sys.platform == "darwin": # macOS
+                    subprocess.call(["open", file_path])
+                else: # Linux and other Unix-like
+                    subprocess.call(["xdg-open", file_path])
+                self.status_text.append(f"Attempting to play: {file_path}")
+            except Exception as e:
+                self.status_text.append(f"Error playing audio: {e}")
+                QMessageBox.warning(self, "Playback Error", f"Could not play audio file: {e}")
+
+    def _update_audio_list_table(self):
+        self.audio_table.setRowCount(0) # Clear existing rows
+        for idx, audio_info in enumerate(self.generated_audio_files):
+            self.audio_table.insertRow(idx)
+            self.audio_table.setItem(idx, 0, QTableWidgetItem(audio_info["name"]))
+            self.audio_table.setItem(idx, 1, QTableWidgetItem(audio_info["duration_str"]))
+            
+            play_button = QPushButton("Play")
+            play_button.clicked.connect(lambda checked=False, path=audio_info["path"]: self._play_audio_file(path))
+            self.audio_table.setCellWidget(idx, 2, play_button)
+
+            delete_button = QPushButton("Delete")
+            delete_button.clicked.connect(lambda checked=False, path=audio_info["path"], row_idx=idx: self._delete_audio_file_from_list(path, row_idx)) # Pass idx for removal from model
+            self.audio_table.setCellWidget(idx, 3, delete_button)
+        # self.audio_table.resizeColumnsToContents() # Adjust column sizes after populating - Removed to prevent shrinking
+
+
+    def _delete_audio_file_from_list(self, file_path, row_idx_in_model_hint):
+        # Find the actual index in self.generated_audio_files based on path,
+        # as row_idx_in_model_hint from the lambda might become stale if items are deleted rapidly
+        # or if the list is modified elsewhere. A more robust way is to find by unique ID or path.
+        actual_idx_to_delete = -1
+        for i, audio_file_info in enumerate(self.generated_audio_files):
+            if audio_file_info["path"] == file_path:
+                actual_idx_to_delete = i
+                break
+        
+        if actual_idx_to_delete != -1:
+            confirm_delete = QMessageBox.question(self, "Confirm Delete",
+                                                  f"Are you sure you want to delete '{os.path.basename(file_path)}'?",
+                                                  QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if confirm_delete == QMessageBox.Yes:
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        self.status_text.append(f"Deleted file from disk: {file_path}")
+                    
+                    del self.generated_audio_files[actual_idx_to_delete]
+                    self.status_text.append(f"Removed '{os.path.basename(file_path)}' from list.")
+                    self._update_audio_list_table() # Refresh the table
+                    
+                except Exception as e:
+                    self.status_text.append(f"Error deleting file {file_path}: {e}")
+                    QMessageBox.warning(self, "Delete Error", f"Could not delete file: {e}")
+        else:
+            self.status_text.append(f"File {file_path} not found in internal list for deletion. Refreshing list.")
+            self._update_audio_list_table() # Refresh table in case of mismatch
 
     def _toggle_custom_voice_ui(self, checked):
         self.custom_voice_path_edit.setEnabled(checked)
@@ -228,6 +374,10 @@ class TTSApp(QWidget):
         use_custom = self.use_custom_voice_checkbox.isChecked()
         custom_voice_file = self.custom_voice_path_edit.text()
 
+        exaggeration_val = self.exaggeration_slider.value() / 100.0
+        temperature_val = self.temperature_slider.value() / 100.0
+        cfg_weight_val = self.cfg_weight_slider.value() / 100.0
+
         if not text.strip():
             QMessageBox.warning(self, "Input Error", "Please enter some text to synthesize.")
             return
@@ -241,7 +391,8 @@ class TTSApp(QWidget):
         self.status_text.append("Starting generation...")
 
         # Create and start worker thread
-        self.worker = TTSWorker(text, use_custom, custom_voice_file if use_custom else None)
+        self.worker = TTSWorker(text, use_custom, custom_voice_file if use_custom else None,
+                                exaggeration_val, temperature_val, cfg_weight_val)
         self.tts_thread = threading.Thread(target=self.worker.run, daemon=True) # Use threading.Thread for simplicity with QObject signals
         
         # Connect signals from worker
@@ -267,12 +418,101 @@ class TTSApp(QWidget):
     def _on_tts_finished(self, status_message, output_audio_path):
         self.status_text.append(f"Success: {status_message}")
         self.status_text.append(f"Output file: {output_audio_path}")
-        self.current_audio_file = output_audio_path
-        self.generate_button.setEnabled(True)
-        self.play_button.setEnabled(True) # Enable play button
-        QMessageBox.information(self, "TTS Complete", f"{status_message}\nSaved to: {output_audio_path}")
-        # We don't have a built-in player, so just notify.
+        self.current_audio_file = output_audio_path # Keep for "Play Last Generated" if still desired
+        
+        duration_str = "N/A"
+        if TTS_AVAILABLE and hasattr(ta, 'info'): # Check if torchaudio.info is available
+            try:
+                audio_info = ta.info(output_audio_path)
+                if audio_info.num_frames > 0 and audio_info.sample_rate > 0:
+                    duration_seconds = audio_info.num_frames / audio_info.sample_rate
+                    minutes = math.floor(duration_seconds / 60)
+                    seconds = math.floor(duration_seconds % 60)
+                    duration_str = f"{minutes:02d}:{seconds:02d}"
+                else:
+                    duration_str = "00:00" # Or some other indicator of empty/invalid audio
+            except Exception as e:
+                self.status_text.append(f"Could not get audio duration for {output_audio_path}: {e}")
+                print(f"Error getting duration for {output_audio_path}: {e}")
 
+        self.generated_audio_files.append({
+            "path": output_audio_path,
+            "name": os.path.basename(output_audio_path),
+            "duration_str": duration_str
+        })
+        # Keep the list to a reasonable size, e.g., last 10-20 items
+        MAX_AUDIO_LIST_SIZE = 20
+        if len(self.generated_audio_files) > MAX_AUDIO_LIST_SIZE:
+            # Potentially remove oldest files from disk too if they are not referenced elsewhere
+            # For now, just remove from the list in UI
+            self.generated_audio_files = self.generated_audio_files[-MAX_AUDIO_LIST_SIZE:]
+
+        self._update_audio_list_table()
+
+        self.generate_button.setEnabled(True)
+        self.play_button.setEnabled(True) # Enable "Play Last Generated" button
+        QMessageBox.information(self, "TTS Complete", f"{status_message}\nSaved to: {output_audio_path}")
+
+    def _load_existing_audio_files(self):
+        if not os.path.exists(OUTPUT_DIR):
+            # Create output directory if it doesn't exist, similar to __main__
+            try:
+                os.makedirs(OUTPUT_DIR)
+                self.status_text.append(f"Output directory '{OUTPUT_DIR}' created during startup check.")
+                print(f"Output directory '{OUTPUT_DIR}' created during startup check.")
+            except OSError as e:
+                self.status_text.append(f"Error creating output directory '{OUTPUT_DIR}' on startup: {e}")
+                print(f"Error creating output directory '{OUTPUT_DIR}' on startup: {e}")
+                return # Cannot proceed if dir creation fails here
+
+        found_files_with_details = []
+        try:
+            for filename in os.listdir(OUTPUT_DIR):
+                if filename.lower().endswith(".wav"):
+                    file_path = os.path.join(OUTPUT_DIR, filename)
+                    try:
+                        mtime = os.path.getmtime(file_path)
+                        duration_str = "N/A"
+                        # Ensure ta and ta.info are valid before calling
+                        if TTS_AVAILABLE and hasattr(ta, 'info') and callable(getattr(ta, 'info', None)):
+                            audio_info = ta.info(file_path)
+                            if audio_info.num_frames > 0 and audio_info.sample_rate > 0:
+                                duration_seconds = audio_info.num_frames / audio_info.sample_rate
+                                minutes = math.floor(duration_seconds / 60)
+                                seconds = math.floor(duration_seconds % 60)
+                                duration_str = f"{minutes:02d}:{seconds:02d}"
+                            else:
+                                duration_str = "00:00" # File might be empty or corrupt
+                        else:
+                             # Fallback if TTS_AVAILABLE is False or ta.info is not proper
+                            duration_str = "N/A (info unavailable)"
+
+                        found_files_with_details.append({
+                            "path": file_path,
+                            "name": filename,
+                            "duration_str": duration_str,
+                            "mtime": mtime
+                        })
+                    except Exception as e:
+                        print(f"Error processing existing file {file_path}: {e}")
+                        # self.status_text.append(f"Couldn't process existing file {filename}: {e}") # Avoid too much noise on status for minor issues
+            
+            # Sort files by modification time, newest first
+            found_files_with_details.sort(key=lambda x: x["mtime"], reverse=True)
+            
+            MAX_AUDIO_LIST_SIZE = 20
+            self.generated_audio_files = found_files_with_details[:MAX_AUDIO_LIST_SIZE]
+            
+            if self.generated_audio_files:
+                 self.status_text.append(f"Loaded {len(self.generated_audio_files)} existing audio file(s) from '{OUTPUT_DIR}'.")
+            else:
+                self.status_text.append(f"No existing .wav files found in '{OUTPUT_DIR}'.")
+
+            self._update_audio_list_table()
+
+        except Exception as e:
+            print(f"Error loading existing audio files: {e}")
+            self.status_text.append(f"Error loading existing audio files: {e}")
     def _on_tts_error(self, error_message):
         self.status_text.append(f"Error: {error_message}")
         self.generate_button.setEnabled(True)
